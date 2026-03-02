@@ -25,13 +25,17 @@ use std::fmt;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::common::DataFusionError;
 use datafusion::error::Result as DFResult;
-use datafusion::execution::TaskContext;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::JoinType;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties, SendableRecordBatchStream,
+    DisplayAs, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
 };
+use futures::StreamExt;
 use iceberg::table::Table;
 
 /// Physical plan node for MERGE INTO operation.
@@ -192,14 +196,138 @@ impl ExecutionPlan for IcebergMergeExec {
 
     fn execute(
         &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
+        partition: usize,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        // TODO: Implement merge execution logic
-        // This will be implemented in the next phase
-        Err(datafusion::error::DataFusionError::NotImplemented(
-            "MERGE execution not yet implemented - coming in next commit".to_string(),
-        ))
+        use datafusion::arrow::array::BooleanArray;
+        use datafusion::arrow::array::RecordBatch;
+        use datafusion::arrow::compute::concat_batches;
+        use datafusion::common::NullEquality;
+        use datafusion::physical_plan::execute_input_stream;
+        use datafusion::physical_plan::joins::utils::JoinOn;
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+        use futures::TryStreamExt;
+
+        // For now, implement a simplified version that collects all data
+        // and performs a basic join operation
+        // Full optimization with streaming joins will come later
+
+        // Step 1: Create a FULL OUTER JOIN between target and source
+        let join_on: JoinOn = self
+            .join_on
+            .iter()
+            .map(|(left, right)| (left.clone(), right.clone()))
+            .collect();
+
+        let join_exec = Arc::new(HashJoinExec::try_new(
+            Arc::clone(&self.target_scan),
+            Arc::clone(&self.source),
+            join_on,
+            None, // No filter
+            &JoinType::Full,
+            None, // No projection
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing, // NULL values don't match
+        )?) as Arc<dyn ExecutionPlan>;
+
+        // Step 2: Execute the join
+        let join_stream = execute_input_stream(
+            join_exec.clone(),
+            join_exec.schema(),
+            partition,
+            Arc::clone(&context),
+        )?;
+
+        let target_schema = self.target_scan.schema();
+        let _source_schema = self.source.schema();
+        let result_schema = Arc::clone(&self.schema);
+
+        let matched_update = self.matched_update.clone();
+        let not_matched_insert = self.not_matched_insert.clone();
+
+        // Step 3: Process join results to classify and apply actions
+        let stream = futures::stream::once(async move {
+            let mut join_stream = join_stream;
+            let mut result_batches = Vec::new();
+
+            while let Some(batch) = join_stream.try_next().await? {
+                // Detect MATCHED vs NOT MATCHED rows
+                // In a FULL OUTER JOIN:
+                // - MATCHED: both target and source columns are non-null
+                // - NOT MATCHED (source only): target columns are null
+                // - Target only (not needed for MERGE): source columns are null
+
+                let target_field_count = target_schema.fields().len();
+
+                // Check first target column for nulls (indicates NOT MATCHED)
+                let target_first_col = batch.column(0);
+
+                // Check first source column for nulls (indicates target-only, which we ignore)
+                let source_first_col = batch.column(target_field_count);
+
+                // Create boolean arrays for filtering
+                let mut matched_mask = Vec::with_capacity(batch.num_rows());
+                let mut not_matched_mask = Vec::with_capacity(batch.num_rows());
+
+                for row_idx in 0..batch.num_rows() {
+                    let target_null = target_first_col.is_null(row_idx);
+                    let source_null = source_first_col.is_null(row_idx);
+
+                    // MATCHED: both sides have data
+                    let is_matched = !target_null && !source_null;
+                    // NOT MATCHED: only source has data
+                    let is_not_matched = target_null && !source_null;
+
+                    matched_mask.push(is_matched);
+                    not_matched_mask.push(is_not_matched);
+                }
+
+                let matched_filter = BooleanArray::from(matched_mask);
+                let not_matched_filter = BooleanArray::from(not_matched_mask);
+
+                // Apply UPDATE action to MATCHED rows
+                if matched_update.is_some() {
+                    let matched_batch =
+                        datafusion::arrow::compute::filter_record_batch(&batch, &matched_filter)?;
+                    if matched_batch.num_rows() > 0 {
+                        // For now, just pass through the target columns with _file
+                        // Full UPDATE expression evaluation will be added when we integrate with logical planner
+                        result_batches.push(matched_batch);
+                    }
+                }
+
+                // Apply INSERT action to NOT MATCHED rows
+                if not_matched_insert.is_some() {
+                    let not_matched_batch = datafusion::arrow::compute::filter_record_batch(
+                        &batch,
+                        &not_matched_filter,
+                    )?;
+                    if not_matched_batch.num_rows() > 0 {
+                        // For now, just pass through the source columns
+                        // Full INSERT expression evaluation will be added when we integrate with logical planner
+                        result_batches.push(not_matched_batch);
+                    }
+                }
+            }
+
+            // Combine all result batches
+            if result_batches.is_empty() {
+                Ok(RecordBatch::new_empty(result_schema))
+            } else {
+                concat_batches(&result_schema, &result_batches).map_err(|e| {
+                    DataFusionError::ArrowError(
+                        Box::new(e),
+                        Some("Failed to concatenate merge result batches".to_string()),
+                    )
+                })
+            }
+        })
+        .boxed();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            stream,
+        )))
     }
 }
 
