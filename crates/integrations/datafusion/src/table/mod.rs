@@ -29,6 +29,7 @@ pub mod metadata_table;
 pub mod table_provider_factory;
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -51,6 +52,9 @@ use metadata_table::IcebergMetadataTableProvider;
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
+use crate::physical_plan::merge::IcebergMergeExec;
+use crate::physical_plan::merge_commit::IcebergMergeCommitExec;
+use crate::physical_plan::merge_write::IcebergMergeWriteExec;
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
 use crate::physical_plan::scan::IcebergTableScan;
@@ -105,6 +109,110 @@ impl IcebergTableProvider {
         // Load fresh table metadata for metadata table access
         let table = self.catalog.load_table(&self.table_ident).await?;
         Ok(IcebergMetadataTableProvider { table, r#type })
+    }
+
+    /// Executes a MERGE INTO operation (upsert).
+    ///
+    /// This method builds a physical execution plan for MERGE operations that:
+    /// 1. Scans the target table with file tracking (_file column)
+    /// 2. Joins target and source data
+    /// 3. Classifies rows as MATCHED or NOT MATCHED
+    /// 4. Applies UPDATE actions to matched rows
+    /// 5. Applies INSERT actions to unmatched rows
+    /// 6. Writes modified data and commits using RowDelta transaction
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - DataFusion session state
+    /// * `source` - Physical plan for source data
+    /// * `join_on` - Join column pairs as (target_column, source_column)
+    /// * `matched_update` - Optional UPDATE assignments for MATCHED rows
+    /// * `not_matched_insert` - Optional INSERT expressions for NOT MATCHED rows
+    ///
+    /// # Returns
+    ///
+    /// Physical execution plan that outputs row count when executed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let plan = provider.merge_into(
+    ///     &state,
+    ///     source_plan,
+    ///     vec![("id".to_string(), "id".to_string())],  // join on id
+    ///     Some(HashMap::from([("value".to_string(), col("new_value"))])),  // UPDATE
+    ///     Some(vec![col("id"), col("new_value")]),  // INSERT
+    /// ).await?;
+    /// ```
+    #[allow(dead_code)] // Will be exposed through logical planner in future commits
+    pub(crate) async fn merge_into(
+        &self,
+        _state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        _join_on: Vec<(String, String)>,
+        _matched_update: Option<HashMap<String, Expr>>,
+        _not_matched_insert: Option<Vec<Expr>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Load fresh table metadata from catalog
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        // Step 1: Create target scan with _file column for COW tracking
+        // This allows us to identify which data files contain matched rows
+        let target_scan = Arc::new(IcebergTableScan::new_with_file_column(
+            table.clone(),
+            None, // Always use current snapshot for catalog-backed provider
+            self.schema.clone(),
+            None, // No projection, scan all columns
+            &[],  // No filters at scan level (join will filter)
+            None, // No limit
+        )) as Arc<dyn ExecutionPlan>;
+
+        // Step 2: Build physical join expressions
+        // For now, we create a simple structure with column name pairs
+        // Full physical expression building will be implemented when we add
+        // logical plan integration (SQL MERGE support)
+        let join_on_physical = Vec::new(); // Placeholder for physical expressions
+
+        // Step 3: Convert matched_update from HashMap<String, Expr> to Vec<(String, PhysicalExpr)>
+        // Placeholder for now - full conversion will be implemented with logical plan support
+        let matched_update_physical = None;
+
+        // Step 4: Convert not_matched_insert from Vec<Expr> to Vec<PhysicalExpr>
+        // Placeholder for now - full conversion will be implemented with logical plan support
+        let not_matched_insert_physical = None;
+
+        // Step 5: Create IcebergMergeExec node
+        let merge_exec = Arc::new(IcebergMergeExec::new(
+            table.clone(),
+            target_scan,
+            source,
+            join_on_physical,
+            matched_update_physical,
+            not_matched_insert_physical,
+            self.schema.clone(),
+        )) as Arc<dyn ExecutionPlan>;
+
+        // Step 6: Create IcebergMergeWriteExec to write new/updated data files
+        let merge_write = Arc::new(IcebergMergeWriteExec::new(
+            table.clone(),
+            merge_exec,
+            self.schema.clone(),
+        )) as Arc<dyn ExecutionPlan>;
+
+        // Step 7: Coalesce partitions to commit all files together
+        let coalesce_partitions = Arc::new(CoalescePartitionsExec::new(merge_write));
+
+        // Step 8: Create IcebergMergeCommitExec to commit via RowDelta transaction
+        Ok(Arc::new(IcebergMergeCommitExec::new(
+            table,
+            self.catalog.clone(),
+            coalesce_partitions,
+            self.schema.clone(),
+        )))
     }
 }
 
