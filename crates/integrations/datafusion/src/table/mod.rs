@@ -462,6 +462,7 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::common::Column;
+    use datafusion::logical_expr::col;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
     use iceberg::io::FileIO;
@@ -975,5 +976,145 @@ mod tests {
             None,
             "Limit should be None when not specified"
         );
+    }
+
+    #[tokio::test]
+    async fn test_merge_plan_creation() {
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        // Test that we can create the MERGE execution pipeline
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .unwrap();
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Create a simple source plan
+        let source = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
+
+        // Create merge plan
+        let merge_plan = provider
+            .merge_into(
+                &state,
+                source,
+                vec![("id".to_string(), "id".to_string())],
+                Some(HashMap::from([("name".to_string(), col("name"))])),
+                Some(vec![col("id"), col("name")]),
+            )
+            .await;
+
+        // Merge plan creation should succeed
+        assert!(merge_plan.is_ok(), "Merge plan creation should succeed");
+
+        let plan = merge_plan.unwrap();
+        assert_eq!(plan.name(), "IcebergMergeCommitExec");
+    }
+
+    #[tokio::test]
+    async fn test_merge_plan_structure() {
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        // Test the structure of the generated MERGE execution plan
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .unwrap();
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let source = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
+
+        let plan = provider
+            .merge_into(
+                &state,
+                source,
+                vec![("id".to_string(), "id".to_string())],
+                Some(HashMap::from([("name".to_string(), col("name"))])),
+                None, // No INSERT
+            )
+            .await
+            .unwrap();
+
+        // Verify plan structure: IcebergMergeCommitExec → CoalescePartitionsExec → IcebergMergeWriteExec → IcebergMergeExec
+        assert_eq!(plan.name(), "IcebergMergeCommitExec");
+
+        let children = plan.children();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name(), "CoalescePartitionsExec");
+
+        let coalesce_children = children[0].children();
+        assert_eq!(coalesce_children.len(), 1);
+        assert_eq!(coalesce_children[0].name(), "IcebergMergeWriteExec");
+
+        let write_children = coalesce_children[0].children();
+        assert_eq!(write_children.len(), 1);
+        assert_eq!(write_children[0].name(), "IcebergMergeExec");
+    }
+
+    #[tokio::test]
+    async fn test_merge_without_update() {
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        // Test merge with only INSERT (no UPDATE)
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .unwrap();
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let source = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
+
+        let plan = provider
+            .merge_into(
+                &state,
+                source,
+                vec![("id".to_string(), "id".to_string())],
+                None, // No UPDATE
+                Some(vec![col("id"), col("name")]),
+            )
+            .await;
+
+        assert!(plan.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_merge_without_insert() {
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        // Test merge with only UPDATE (no INSERT)
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .unwrap();
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let source = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
+
+        let plan = provider
+            .merge_into(
+                &state,
+                source,
+                vec![("id".to_string(), "id".to_string())],
+                Some(HashMap::from([("name".to_string(), col("name"))])),
+                None, // No INSERT
+            )
+            .await;
+
+        assert!(plan.is_ok());
     }
 }
