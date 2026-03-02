@@ -21,6 +21,7 @@ pub(crate) mod merge;
 pub(crate) mod merge_commit;
 pub(crate) mod merge_write;
 pub(crate) mod metadata_scan;
+pub(crate) mod partition_merge;
 pub(crate) mod project;
 pub(crate) mod repartition;
 pub(crate) mod scan;

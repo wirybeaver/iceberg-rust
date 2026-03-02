@@ -121,6 +121,14 @@ impl IcebergTableProvider {
     /// 5. Applies INSERT actions to unmatched rows
     /// 6. Writes modified data and commits using RowDelta transaction
     ///
+    /// # Partition Optimization
+    ///
+    /// When join keys align with partition columns, the method automatically applies
+    /// partition-aware optimization (Storage Partition Join style):
+    /// - Co-locates source and target data by partition
+    /// - Eliminates expensive shuffles
+    /// - Improves performance for partitioned tables
+    ///
     /// # Arguments
     ///
     /// * `state` - DataFusion session state
@@ -147,12 +155,14 @@ impl IcebergTableProvider {
     #[allow(dead_code)] // Will be exposed through logical planner in future commits
     pub(crate) async fn merge_into(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         source: Arc<dyn ExecutionPlan>,
-        _join_on: Vec<(String, String)>,
+        join_on: Vec<(String, String)>,
         _matched_update: Option<HashMap<String, Expr>>,
         _not_matched_insert: Option<Vec<Expr>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        use crate::physical_plan::partition_merge::optimize_merge_for_partitions;
+
         // Load fresh table metadata from catalog
         let table = self
             .catalog
@@ -171,42 +181,59 @@ impl IcebergTableProvider {
             None, // No limit
         )) as Arc<dyn ExecutionPlan>;
 
-        // Step 2: Build physical join expressions
+        // Step 2: Apply partition-aware optimization if applicable
+        // This co-locates source and target by partition to avoid shuffle
+        let target_partitions =
+            NonZeroUsize::new(state.config().target_partitions()).ok_or_else(|| {
+                DataFusionError::Configuration(
+                    "target_partitions must be greater than 0".to_string(),
+                )
+            })?;
+
+        let (optimized_target, optimized_source) = optimize_merge_for_partitions(
+            target_scan,
+            source,
+            &join_on,
+            &table,
+            target_partitions,
+        )?;
+
+        // Step 3: Build physical join expressions
         // For now, we create a simple structure with column name pairs
         // Full physical expression building will be implemented when we add
         // logical plan integration (SQL MERGE support)
         let join_on_physical = Vec::new(); // Placeholder for physical expressions
 
-        // Step 3: Convert matched_update from HashMap<String, Expr> to Vec<(String, PhysicalExpr)>
+        // Step 4: Convert matched_update from HashMap<String, Expr> to Vec<(String, PhysicalExpr)>
         // Placeholder for now - full conversion will be implemented with logical plan support
         let matched_update_physical = None;
 
-        // Step 4: Convert not_matched_insert from Vec<Expr> to Vec<PhysicalExpr>
+        // Step 5: Convert not_matched_insert from Vec<Expr> to Vec<PhysicalExpr>
         // Placeholder for now - full conversion will be implemented with logical plan support
         let not_matched_insert_physical = None;
 
-        // Step 5: Create IcebergMergeExec node
+        // Step 6: Create IcebergMergeExec node with optimized inputs
         let merge_exec = Arc::new(IcebergMergeExec::new(
             table.clone(),
-            target_scan,
-            source,
+            optimized_target,
+            optimized_source,
             join_on_physical,
             matched_update_physical,
             not_matched_insert_physical,
             self.schema.clone(),
         )) as Arc<dyn ExecutionPlan>;
 
-        // Step 6: Create IcebergMergeWriteExec to write new/updated data files
+        // Step 7: Create IcebergMergeWriteExec to write new/updated data files
         let merge_write = Arc::new(IcebergMergeWriteExec::new(
             table.clone(),
             merge_exec,
             self.schema.clone(),
         )) as Arc<dyn ExecutionPlan>;
 
-        // Step 7: Coalesce partitions to commit all files together
+        // Step 8: Coalesce partitions to commit all files together
         let coalesce_partitions = Arc::new(CoalescePartitionsExec::new(merge_write));
 
-        // Step 8: Create IcebergMergeCommitExec to commit via RowDelta transaction
+        // Step 9: Create IcebergMergeCommitExec to commit via RowDelta transaction
         Ok(Arc::new(IcebergMergeCommitExec::new(
             table,
             self.catalog.clone(),
