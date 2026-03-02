@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::vec;
 
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::arrow::datatypes::{
+    DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -53,6 +55,9 @@ pub struct IcebergTableScan {
     predicates: Option<Predicate>,
     /// Optional limit on the number of rows to return
     limit: Option<usize>,
+    /// Whether to include the _file metadata column for tracking file paths
+    /// Used in MERGE operations for Copy-on-Write tracking
+    include_file_column: bool,
 }
 
 impl IcebergTableScan {
@@ -80,6 +85,54 @@ impl IcebergTableScan {
             projection,
             predicates,
             limit,
+            include_file_column: false,
+        }
+    }
+
+    /// Creates a new [`IcebergTableScan`] with the _file metadata column included.
+    ///
+    /// This is used in MERGE operations to track which data file each row originated from,
+    /// enabling precise Copy-on-Write (COW) updates where only files with modified rows
+    /// are rewritten.
+    #[allow(dead_code)] // Will be used in Commit 4
+    pub(crate) fn new_with_file_column(
+        table: Table,
+        snapshot_id: Option<i64>,
+        schema: ArrowSchemaRef,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Self {
+        let mut output_schema = match projection {
+            None => schema.clone(),
+            Some(projection) => Arc::new(schema.project(projection).unwrap()),
+        };
+
+        // Add _file field to output schema (String type)
+        let mut fields = output_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("_file", DataType::Utf8, false)));
+        output_schema = Arc::new(ArrowSchema::new(fields));
+
+        let plan_properties = Self::compute_properties(output_schema.clone());
+        let mut projection = get_column_names(schema.clone(), projection);
+
+        // Add _file metadata column to projection
+        if let Some(ref mut cols) = projection
+            && !cols.contains(&"_file".to_string())
+        {
+            cols.push("_file".to_string());
+        }
+
+        let predicates = convert_filters_to_predicate(filters);
+
+        Self {
+            table,
+            snapshot_id,
+            plan_properties,
+            projection,
+            predicates,
+            limit,
+            include_file_column: true,
         }
     }
 
@@ -101,6 +154,11 @@ impl IcebergTableScan {
 
     pub fn limit(&self) -> Option<usize> {
         self.limit
+    }
+
+    /// Returns whether the _file metadata column is included in this scan.
+    pub fn includes_file_column(&self) -> bool {
+        self.include_file_column
     }
 
     /// Computes [`PlanProperties`] used in query optimization.
