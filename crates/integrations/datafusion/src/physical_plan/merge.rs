@@ -199,8 +199,7 @@ impl ExecutionPlan for IcebergMergeExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        use datafusion::arrow::array::BooleanArray;
-        use datafusion::arrow::array::RecordBatch;
+        use datafusion::arrow::array::{BooleanArray, RecordBatch};
         use datafusion::arrow::compute::concat_batches;
         use datafusion::common::NullEquality;
         use datafusion::physical_plan::execute_input_stream;

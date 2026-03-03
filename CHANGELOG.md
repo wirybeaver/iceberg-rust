@@ -24,6 +24,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Features
+
+* **DataFusion Integration - MERGE INTO Support:**
+  * feat(datafusion): Add comprehensive MERGE INTO support with Copy-on-Write strategy
+  * Implements row-level modifications (UPDATE/INSERT) for Iceberg tables
+  * **Transaction Layer:**
+    * `RowDeltaAction`: New transaction action supporting add_data_files(), remove_data_files(), and add_delete_files()
+    * Integrates with existing SnapshotProducer infrastructure
+    * Supports both Copy-on-Write (COW) and future Merge-on-Read (MOR) modes
+  * **Physical Execution:**
+    * `IcebergMergeExec`: Join-based row classification (MATCHED/NOT MATCHED)
+    * `IcebergMergeWriteExec`: TaskWriter integration for writing merged data
+    * `IcebergMergeCommitExec`: RowDelta transaction commit handling
+    * Precision COW tracking via `_file` metadata column
+  * **Partition Optimization:**
+    * Storage Partition Join (SPJ) style optimization for partitioned tables
+    * Automatic co-location of source and target data by partition
+    * Eliminates shuffle when join keys align with partition columns
+    * Supports Identity and Bucket transforms
+  * **Pipeline:**
+    * Target Scan (with _file tracking) → HashJoinExec → Row Classification → TaskWriter → RowDelta Commit
+    * Automatic partition optimization when applicable
+    * Reuses existing write infrastructure (ParquetWriterBuilder, TaskWriter)
+  * **Test Coverage:**
+    * 98 unit tests (10 new merge-specific tests)
+    * Integration tests for merge pipeline structure and execution
+    * Partition optimization applicability tests
+
 ## [v0.8.0] - 2026-01-06
 
 ### Breaking Changes
