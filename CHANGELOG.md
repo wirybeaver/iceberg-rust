@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### All Changes
 
+* feat(datafusion): Add UPDATE support with RowDelta transaction and Copy-on-Write strategy by @Claude in https://github.com/apache/iceberg-rust/pull/XXXX
 * chore(deps): Bump tempfile from 3.22.0 to 3.23.0 by @dependabot[bot] in https://github.com/apache/iceberg-rust/pull/1717
 * chore(deps): Bump rand from 0.8.5 to 0.9.2 by @dependabot[bot] in https://github.com/apache/iceberg-rust/pull/1716
 * chore(deps): Bump crate-ci/typos from 1.36.2 to 1.36.3 by @dependabot[bot] in https://github.com/apache/iceberg-rust/pull/1715
