@@ -40,6 +40,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use iceberg::arrow::schema_to_arrow_schema;
@@ -55,6 +56,8 @@ use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
 use crate::physical_plan::scan::IcebergTableScan;
 use crate::physical_plan::sort::sort_by_partition;
+use crate::physical_plan::update_commit::IcebergUpdateCommitExec;
+use crate::physical_plan::update_write::IcebergUpdateWriteExec;
 use crate::physical_plan::write::IcebergWriteExec;
 
 /// Catalog-backed table provider with automatic metadata refresh.
@@ -105,6 +108,146 @@ impl IcebergTableProvider {
         // Load fresh table metadata for metadata table access
         let table = self.catalog.load_table(&self.table_ident).await?;
         Ok(IcebergMetadataTableProvider { table, r#type })
+    }
+
+    /// Internal UPDATE implementation that works with PhysicalExpr.
+    ///
+    /// Executes an UPDATE operation on the table using Copy-on-Write (COW) strategy:
+    /// 1. Scans the table with WHERE clause filters to find matching rows
+    /// 2. Applies UPDATE column assignments (SET clause)
+    /// 3. Writes modified rows to new data files
+    /// 4. Marks original data files as deleted
+    /// 5. Commits atomically using RowDelta transaction
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - DataFusion session state
+    /// * `filters` - WHERE clause filters (empty for UPDATE all rows)
+    /// * `assignments` - Column assignments from SET clause: (column_name, physical_expression)
+    ///
+    /// # Returns
+    ///
+    /// An execution plan that returns a single row with the count of updated rows.
+    ///
+    /// # Example Pipeline
+    ///
+    /// ```text
+    /// IcebergTableScan (filtered)
+    ///   ↓
+    /// [Optional: Project + Repartition + Sort for partitioned tables]
+    ///   ↓
+    /// IcebergUpdateWriteExec (apply assignments, write new files, track deletions)
+    ///   ↓
+    /// CoalescePartitionsExec
+    ///   ↓
+    /// IcebergUpdateCommitExec (commit via RowDelta)
+    ///   ↓
+    /// Result: [count: UInt64]
+    /// ```
+    async fn update_internal(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Load fresh table metadata from catalog
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        // Step 1: Create table scan WITHOUT row-level filters
+        //
+        // **Why no filters on the scan?**
+        // We use filters in get_deleted_data_files() to identify which files need rewriting
+        // (via partition pruning and file-level statistics). But once we've identified those
+        // files, we must read ALL rows from them to preserve non-matching rows during rewrite.
+        //
+        // **Performance**: Partition pruning and file-level filtering happen in
+        // UpdateWriteExec.get_deleted_data_files(), reducing files scanned/rewritten.
+        //
+        // **Row-level filtering**: Happens in UpdateWriteExec.apply_assignments()
+        // using conditional updates with boolean masks.
+        let scan_plan = Arc::new(IcebergTableScan::new(
+            table.clone(),
+            None, // Use current snapshot
+            self.schema.clone(),
+            None, // No projection - need all columns
+            &[],  // NO filters - read all rows from identified files
+            None, // No limit
+        ));
+
+        let partition_spec = table.metadata().default_partition_spec();
+
+        // Step 2: Handle partitioned tables (same as INSERT pipeline)
+        let write_input = if !partition_spec.is_unpartitioned() {
+            // Project partition values
+            let plan_with_partition = project_with_partition(scan_plan, &table)?;
+
+            // Repartition for parallel processing
+            let target_partitions = NonZeroUsize::new(state.config().target_partitions())
+                .ok_or_else(|| {
+                    DataFusionError::Configuration(
+                        "target_partitions must be greater than 0".to_string(),
+                    )
+                })?;
+
+            let repartitioned_plan =
+                repartition(plan_with_partition, table.metadata_ref(), target_partitions)?;
+
+            // Apply sort if not in fanout mode
+            let fanout_enabled = table
+                .metadata()
+                .properties()
+                .get(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED)
+                .map(|value| {
+                    value
+                        .parse::<bool>()
+                        .map_err(|e| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "Invalid value for {}, expected 'true' or 'false'",
+                                    TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED
+                                ),
+                            )
+                            .with_source(e)
+                        })
+                        .map_err(to_datafusion_error)
+                })
+                .transpose()?
+                .unwrap_or(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT);
+
+            if fanout_enabled {
+                repartitioned_plan
+            } else {
+                sort_by_partition(repartitioned_plan)?
+            }
+        } else {
+            // Unpartitioned table: use scan directly
+            scan_plan
+        };
+
+        // Step 3: Create UpdateWriteExec to apply assignments and write new files
+        let update_write_plan = Arc::new(IcebergUpdateWriteExec::new(
+            table.clone(),
+            write_input,
+            filters,
+            assignments,
+            self.schema.clone(),
+        ));
+
+        // Step 4: Coalesce partitions for single-partition commit
+        let coalesce_plan = Arc::new(CoalescePartitionsExec::new(update_write_plan));
+
+        // Step 5: Create UpdateCommitExec to commit via RowDelta transaction
+        Ok(Arc::new(IcebergUpdateCommitExec::new(
+            table,
+            self.catalog.clone(),
+            coalesce_plan,
+            self.schema.clone(),
+        )))
     }
 }
 
@@ -232,6 +375,37 @@ impl TableProvider for IcebergTableProvider {
             coalesce_partitions,
             self.schema.clone(),
         )))
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Convert logical Expr assignments to PhysicalExpr
+        // We need to create a DFSchema from the Arrow schema
+        use datafusion::common::DFSchema;
+
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+
+        let physical_assignments: Vec<(String, Arc<dyn PhysicalExpr>)> = assignments
+            .into_iter()
+            .map(|(col_name, expr)| {
+                // Create physical expression from logical expression using the session state
+                let physical_expr = state.create_physical_expr(expr, &df_schema).map_err(|e| {
+                    DataFusionError::Plan(format!(
+                        "Failed to create physical expression for column {}: {}",
+                        col_name, e
+                    ))
+                })?;
+                Ok((col_name, physical_expr))
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+
+        // Call our internal update implementation with physical expressions
+        self.update_internal(state, filters, physical_assignments)
+            .await
     }
 }
 
