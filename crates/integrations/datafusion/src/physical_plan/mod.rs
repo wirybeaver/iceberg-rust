@@ -22,6 +22,7 @@ pub(crate) mod project;
 pub(crate) mod repartition;
 pub(crate) mod scan;
 pub(crate) mod sort;
+pub(crate) mod update_write;
 pub(crate) mod write;
 
 pub(crate) const DATA_FILES_COL_NAME: &str = "data_files";
