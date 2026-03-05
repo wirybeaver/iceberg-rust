@@ -148,13 +148,14 @@ impl IcebergUpdateWriteExec {
     ///
     /// This ensures non-matching rows are preserved during Copy-on-Write.
     ///
-    /// Applies UPDATE column assignments to a RecordBatch, conditionally based on the WHERE predicate.
+    /// **Performance Optimization**: Returns true if any rows were actually modified,
+    /// false if all rows remain unchanged (useful for metrics).
     async fn apply_assignments(
         &self,
         batch: RecordBatch,
         predicate: Option<&Arc<dyn PhysicalExpr>>,
         _context: &Arc<TaskContext>,
-    ) -> DFResult<RecordBatch> {
+    ) -> DFResult<(RecordBatch, bool)> {
         // If there's a predicate, evaluate it to get a boolean mask
         let selection_mask = if let Some(pred) = predicate {
             let result = pred.evaluate(&batch)?;
@@ -174,6 +175,15 @@ impl IcebergUpdateWriteExec {
             // No predicate means all rows match
             datafusion::arrow::array::BooleanArray::from(vec![true; batch.num_rows()])
         };
+
+        // **Early Exit Optimization**: Check if any rows match
+        // If no rows match, we can skip assignment evaluation entirely
+        let has_matches = selection_mask.iter().any(|v| v == Some(true));
+
+        if !has_matches {
+            // No rows match - return unchanged batch
+            return Ok((batch, false));
+        }
 
         let mut columns: HashMap<String, ArrayRef> = batch
             .schema()
@@ -227,17 +237,38 @@ impl IcebergUpdateWriteExec {
             )
         })?;
 
-        Ok(result_batch)
+        Ok((result_batch, true))
     }
 
     /// Get DataFile objects for files that need to be rewritten (for deletion tracking).
     ///
     /// Returns full DataFile objects with proper metadata (size, record count, partition)
     /// needed for RowDelta transaction to mark them as deleted.
+    ///
+    /// **Performance Optimizations**:
+    /// 1. **Partition pruning**: Applies WHERE clause filters to skip entire partitions
+    ///    that cannot contain matching rows (e.g., `date = '2024-01-01'` only scans
+    ///    that partition).
+    ///
+    /// 2. **File-level filtering**: Uses manifest statistics (min/max values, null counts)
+    ///    to skip files that cannot contain matching rows (e.g., if `WHERE id > 1000`
+    ///    and file has `max(id) = 500`, skip the file).
+    ///
+    /// **Important**: We apply filters for partition/file-level pruning, but NOT for
+    /// row-level filtering. In Copy-on-Write mode, we must rewrite entire files to
+    /// preserve non-matching rows. Row-level filtering happens in `apply_assignments()`.
     async fn get_deleted_data_files(&self) -> DFResult<Vec<iceberg::spec::DataFile>> {
         use iceberg::spec::{DataFileBuilder, Struct};
 
-        let scan_builder = self.table.scan().select_empty();
+        // Convert WHERE clause filters to Iceberg predicates for partition/file pruning
+        let predicates = convert_filters_to_predicate(&self.filters);
+
+        // Build table scan with filters for partition pruning and file-level filtering
+        // This dramatically reduces files scanned on partitioned tables
+        let mut scan_builder = self.table.scan().select_empty();
+        if let Some(pred) = predicates {
+            scan_builder = scan_builder.with_filter(pred);
+        }
 
         let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
@@ -479,17 +510,34 @@ impl ExecutionPlan for IcebergUpdateWriteExec {
             // Get DataFile objects for files that will be rewritten (with proper metadata)
             let deleted_data_files = self_clone.get_deleted_data_files().await?;
 
+            // Metrics for optimization observability
+            let mut total_batches = 0u64;
+            let mut batches_with_updates = 0u64;
+            let mut total_rows_scanned = 0u64;
+            let mut total_rows_updated = 0u64;
+
             let mut task_writer = task_writer;
             let mut input_stream = data;
 
             // Process input batches: apply assignments and write
             while let Some(batch) = input_stream.next().await {
                 let batch = batch?;
+                total_batches += 1;
+                total_rows_scanned += batch.num_rows() as u64;
 
                 // Apply UPDATE assignments (conditionally based on WHERE predicate)
-                let updated_batch = self_clone
+                let (updated_batch, has_changes) = self_clone
                     .apply_assignments(batch, where_predicate.as_ref(), &context_clone)
                     .await?;
+
+                if has_changes {
+                    batches_with_updates += 1;
+                }
+
+                // Count updated rows (approximate - counts all rows in batches with matches)
+                if has_changes {
+                    total_rows_updated += updated_batch.num_rows() as u64;
+                }
 
                 // Write updated data (all rows, both modified and unmodified)
                 task_writer
@@ -499,6 +547,30 @@ impl ExecutionPlan for IcebergUpdateWriteExec {
             }
 
             let data_files = task_writer.close().await.map_err(to_datafusion_error)?;
+
+            // Log optimization metrics
+            eprintln!("UPDATE execution metrics:");
+            eprintln!("  Files to rewrite: {}", deleted_data_files.len());
+            eprintln!("  Total batches processed: {}", total_batches);
+            eprintln!(
+                "  Batches with updates: {} ({:.1}%)",
+                batches_with_updates,
+                if total_batches > 0 {
+                    (batches_with_updates as f64 / total_batches as f64) * 100.0
+                } else {
+                    0.0
+                }
+            );
+            eprintln!("  Total rows scanned: {}", total_rows_scanned);
+            eprintln!(
+                "  Approximate rows updated: {} ({:.1}%)",
+                total_rows_updated,
+                if total_rows_scanned > 0 {
+                    (total_rows_updated as f64 / total_rows_scanned as f64) * 100.0
+                } else {
+                    0.0
+                }
+            );
 
             // Convert new data files to JSON strings
             let data_files_strs: Vec<String> = data_files
